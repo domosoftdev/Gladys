@@ -13,6 +13,16 @@ import sys
 import urllib.parse
 import requests
 from datetime import datetime
+from sslyze import (
+    Scanner,
+    ServerScanRequest,
+    ServerNetworkLocation,
+    ScanCommandAttemptStatusEnum,
+    ServerScanStatusEnum,
+)
+from sslyze.errors import ServerHostnameCouldNotBeResolved
+from sslyze.plugins.scan_commands import ScanCommand
+import dns.resolver
 
 def check_host_exists(hostname):
     """Vérifie si un nom d'hôte existe via une résolution DNS."""
@@ -98,6 +108,61 @@ def check_ssl_certificate(hostname):
     print(f"\n  Pour une analyse SSL/TLS complète, consultez le rapport SSL Labs :")
     print(f"  https://www.ssllabs.com/ssltest/analyze.html?d={hostname}")
 
+def scan_tls_protocols(hostname):
+    """Scanne les protocoles SSL/TLS supportés en utilisant sslyze."""
+    print("\n--- Scan des protocoles SSL/TLS supportés ---")
+    try:
+        server_location = ServerNetworkLocation(hostname=hostname, port=443)
+
+        scan_request = ServerScanRequest(
+            server_location=server_location,
+            scan_commands={
+                ScanCommand.SSL_2_0_CIPHER_SUITES, ScanCommand.SSL_3_0_CIPHER_SUITES,
+                ScanCommand.TLS_1_0_CIPHER_SUITES, ScanCommand.TLS_1_1_CIPHER_SUITES,
+                ScanCommand.TLS_1_2_CIPHER_SUITES, ScanCommand.TLS_1_3_CIPHER_SUITES,
+            },
+        )
+
+        scanner = Scanner()
+        scanner.queue_scans([scan_request])
+
+        print(f"  Scan en cours sur {hostname}, cela peut prendre un moment...")
+
+        for server_scan_result in scanner.get_results():
+            if server_scan_result.scan_status == ServerScanStatusEnum.ERROR_NO_CONNECTIVITY:
+                print(f"  ERREUR : Impossible de se connecter à {hostname}: {server_scan_result.connectivity_error_trace}")
+                return
+
+            # Associer les résultats aux noms de protocoles
+            scan_result = server_scan_result.scan_result
+            protocol_results = {
+                "SSL 2.0": scan_result.ssl_2_0_cipher_suites,
+                "SSL 3.0": scan_result.ssl_3_0_cipher_suites,
+                "TLS 1.0": scan_result.tls_1_0_cipher_suites,
+                "TLS 1.1": scan_result.tls_1_1_cipher_suites,
+                "TLS 1.2": scan_result.tls_1_2_cipher_suites,
+                "TLS 1.3": scan_result.tls_1_3_cipher_suites,
+            }
+
+            for name, result_attempt in protocol_results.items():
+                if result_attempt.status == ScanCommandAttemptStatusEnum.ERROR:
+                    print(f"    ⚠️  Le scan pour {name} a échoué : {result_attempt.error_reason}")
+                    continue
+
+                result = result_attempt.result
+                if result.accepted_cipher_suites:
+                    if name in ["TLS 1.2", "TLS 1.3"]:
+                        print(f"    ✅ {name} : Supporté (CONFORME)")
+                    else:
+                        print(f"    ❌ {name} : Supporté (NON CONFORME - Vulnérable)")
+                else:
+                    print(f"    ✅ {name} : Non supporté (CONFORME)")
+            break
+    except ServerHostnameCouldNotBeResolved:
+        print(f"  ERREUR : Le nom d'hôte '{hostname}' n'a pas pu être résolu.")
+    except Exception as e:
+        print(f"  Une erreur inattendue est survenue lors du scan sslyze : {e}")
+
 def check_http_to_https_redirect(hostname):
     """Vérifie si le site redirige automatiquement de HTTP vers HTTPS."""
     print("\n--- Analyse de la redirection HTTP vers HTTPS ---")
@@ -119,36 +184,109 @@ def check_http_to_https_redirect(hostname):
     except requests.exceptions.RequestException as e:
         print(f"  Erreur inattendue lors du test de redirection : {e}")
 
+def check_email_security_dns(hostname):
+    """Vérifie la présence des enregistrements DNS de sécurité e-mail (DMARC, SPF)."""
+    print("\n--- Analyse des enregistrements de sécurité e-mail (DNS) ---")
+
+    # 1. Vérification DMARC
+    print("\n  1. Enregistrement DMARC :")
+    try:
+        dmarc_query = f"_dmarc.{hostname}"
+        answers = dns.resolver.resolve(dmarc_query, 'TXT')
+        dmarc_record = ' '.join([b.decode('utf-8') for b in answers[0].strings])
+        print(f"    ✅ SUCCÈS : Enregistrement DMARC trouvé.")
+        print(f"      Valeur : {dmarc_record}")
+    except dns.resolver.NXDOMAIN:
+        print("    ❌ ERREUR : Aucun enregistrement DMARC trouvé. Très recommandé.")
+    except dns.resolver.NoAnswer:
+        print("    ❌ ERREUR : La requête DMARC n'a retourné aucune réponse.")
+    except Exception as e:
+        print(f"    ⚠️ AVERTISSEMENT : Une erreur est survenue lors de la recherche DMARC : {e}")
+
+    # 2. Vérification SPF
+    print("\n  2. Enregistrement SPF :")
+    try:
+        answers = dns.resolver.resolve(hostname, 'TXT')
+        spf_record = None
+        for record in answers:
+            txt_record = ' '.join([b.decode('utf-8') for b in record.strings])
+            if txt_record.startswith('v=spf1'):
+                spf_record = txt_record
+                break
+
+        if spf_record:
+            print(f"    ✅ SUCCÈS : Enregistrement SPF trouvé.")
+            print(f"      Valeur : {spf_record}")
+        else:
+            print("    ❌ ERREUR : Aucun enregistrement SPF (v=spf1) trouvé dans les enregistrements TXT.")
+    except dns.resolver.NXDOMAIN:
+        print(f"    ❌ ERREUR : Le domaine '{hostname}' n'existe pas.")
+    except dns.resolver.NoAnswer:
+        print("    ❌ ERREUR : Aucune réponse pour les enregistrements TXT du domaine (nécessaire pour SPF).")
+    except Exception as e:
+        print(f"    ⚠️ AVERTISSEMENT : Une erreur est survenue lors de la recherche SPF : {e}")
+
 def check_security_headers(hostname):
-    """Vérifie la présence des en-têtes de sécurité HTTP en utilisant requests."""
+    """Analyse les en-têtes de sécurité HTTP, y compris leurs valeurs."""
     print("\n--- Analyse des en-têtes de sécurité HTTP ---")
     try:
         url = f"https://{hostname}"
         response = requests.get(url, timeout=10)
-        headers = response.headers
-
-        security_headers_to_check = [
-            "Strict-Transport-Security",
-            "Content-Security-Policy",
-            "Content-Security-Policy-Report-Only",
-            "X-Content-Type-Options",
-            "X-Frame-Options",
-            "Referrer-Policy",
-            "Permissions-Policy"
-        ]
+        headers = {k.lower(): v for k, v in response.headers.items()}
 
         print(f"  Analyse des en-têtes pour l'URL finale : {response.url}")
 
-        print("\n  En-têtes de sécurité trouvés :")
-        found_any = False
-        for header in security_headers_to_check:
-            if header in headers:
-                print(f"    - {header}: Trouvé")
-                # print(f"      Valeur: {headers[header]}") # Optionnel: décommenter pour voir la valeur
-                found_any = True
+        # 1. Strict-Transport-Security (HSTS)
+        print("\n  1. Strict-Transport-Security (HSTS) :")
+        if 'strict-transport-security' in headers:
+            value = headers['strict-transport-security']
+            max_age_found = False
+            if 'max-age' in value:
+                max_age_val = int(value.split('max-age=')[1].split(';')[0])
+                if max_age_val >= 15552000: # ~6 mois
+                    print(f"    ✅ SUCCÈS : HSTS est activé avec un max-age long ({max_age_val}s).")
+                    max_age_found = True
+                else:
+                    print(f"    ⚠️ AVERTISSEMENT : HSTS est activé, mais le max-age est court ({max_age_val}s). Recommandé : >= 15552000.")
+            if not max_age_found:
+                 print(f"    ⚠️ AVERTISSEMENT : L'en-tête HSTS est présent mais n'a pas de directive 'max-age'.")
 
-        if not found_any:
-            print("    Aucun des en-têtes de sécurité majeurs n'a été trouvé.")
+            if 'includesubdomains' in value.lower():
+                print("    ✅ SUCCÈS : La directive 'includeSubDomains' est présente.")
+            else:
+                print("    ⚠️ AVERTISSEMENT : La directive 'includeSubDomains' est recommandée mais absente.")
+        else:
+            print("    ❌ ERREUR : L'en-tête HSTS est manquant. Très recommandé.")
+
+        # 2. X-Frame-Options
+        print("\n  2. X-Frame-Options :")
+        if 'x-frame-options' in headers:
+            value = headers['x-frame-options'].upper()
+            if value in ['DENY', 'SAMEORIGIN']:
+                print(f"    ✅ SUCCÈS : X-Frame-Options est correctement configuré à '{value}'.")
+            else:
+                print(f"    ⚠️ AVERTISSEMENT : X-Frame-Options a une valeur non standard : '{value}'.")
+        else:
+            print("    ❌ ERREUR : L'en-tête X-Frame-Options est manquant. Recommandé pour prévenir le clickjacking.")
+
+        # 3. X-Content-Type-Options
+        print("\n  3. X-Content-Type-Options :")
+        if 'x-content-type-options' in headers:
+            value = headers['x-content-type-options'].lower()
+            if value == 'nosniff':
+                print(f"    ✅ SUCCÈS : X-Content-Type-Options est correctement configuré à 'nosniff'.")
+            else:
+                print(f"    ⚠️ AVERTISSEMENT : X-Content-Type-Options a une valeur inattendue : '{value}'.")
+        else:
+            print("    ❌ ERREUR : L'en-tête X-Content-Type-Options est manquant.")
+
+        # 4. Content-Security-Policy (CSP)
+        print("\n  4. Content-Security-Policy (CSP) :")
+        if 'content-security-policy' in headers:
+            print("    ✅ SUCCÈS : L'en-tête Content-Security-Policy est présent.")
+            print(f"      Valeur : {headers['content-security-policy'][:100]}...") # Affiche les 100 premiers caractères
+        else:
+            print("    ⚠️ AVERTISSEMENT : L'en-tête Content-Security-Policy est manquant. Recommandé pour une défense en profondeur.")
 
     except requests.exceptions.Timeout:
         print("  ERREUR : La connexion au serveur a échoué (timeout) lors de la récupération des en-têtes.")
@@ -174,8 +312,10 @@ def main():
 
     print(f"Hôte trouvé. Début de l'analyse de : {hostname}")
     check_ssl_certificate(hostname)
+    scan_tls_protocols(hostname)
     check_http_to_https_redirect(hostname)
     check_security_headers(hostname)
+    check_email_security_dns(hostname)
 
 if __name__ == "__main__":
     main()
