@@ -10,10 +10,8 @@ Ce script Python analyse une URL donnée pour évaluer certains aspects de sa co
 
 Le script effectue actuellement les vérifications suivantes :
 
-1.  **Analyse du Certificat SSL/TLS**
-    *   Vérifie le **sujet** du certificat (le nom commun).
-    *   Vérifie l'**émetteur** du certificat.
-    *   Vérifie la **date d'expiration** et signale si le certificat est expiré.
+1.  **Vérification de la chaîne de confiance et de l'expiration du certificat SSL/TLS**
+    *   C'est le point de départ. Si le certificat est invalide ou expiré, tout le reste est compromis. Un certificat non valide empêche la connexion sécurisée, ce qui expose les données des utilisateurs. Le vérifier en premier garantit que la communication entre le client et le serveur est sécurisée.
 
 2.  **Analyse des En-têtes de Sécurité HTTP**
     *   Détecte la présence des en-têtes de sécurité recommandés suivants :
@@ -24,6 +22,9 @@ Le script effectue actuellement les vérifications suivantes :
         *   `X-Frame-Options`
         *   `Referrer-Policy`
         *   `Permissions-Policy`
+
+3.  **Redirections HTTP vers HTTPS**
+    *   Une fois que vous savez que le certificat est valide, assurez-vous que toutes les requêtes non chiffrées sont automatiquement redirigées vers la version sécurisée du site. Si ce n'est pas le cas, un attaquant peut intercepter les premières requêtes des utilisateurs sur une connexion non chiffrée.
 
 ## Installation
 
