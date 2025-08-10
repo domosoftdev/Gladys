@@ -23,6 +23,18 @@ from sslyze import (
 from sslyze.errors import ServerHostnameCouldNotBeResolved
 from sslyze.plugins.scan_commands import ScanCommand
 import dns.resolver
+import whois
+import json
+
+# --- Global variables for reporting ---
+report_file = None
+JSON_RESULTS = {}
+
+def output(message="", json_enabled=False):
+    """Affiche un message dans la console et l'écrit dans le fichier de rapport si le format est texte."""
+    print(message)
+    if report_file and not json_enabled:
+        report_file.write(message + '\n')
 
 def check_host_exists(hostname):
     """Vérifie si un nom d'hôte existe via une résolution DNS."""
@@ -42,280 +54,256 @@ def get_hostname(url):
         url = url.split('/')[0]
     return url
 
-def check_ssl_certificate(hostname):
-    """Vérifie le certificat SSL/TLS d'un hôte."""
-    print("\n--- Analyse du certificat SSL/TLS ---")
+def check_ssl_certificate(hostname, json_enabled=False):
+    output("\n--- Analyse du certificat SSL/TLS ---", json_enabled)
+    results = {"status": "error", "details": {}}
     context = ssl.create_default_context()
     try:
-        with socket.create_connection((hostname, 443), timeout=5) as sock:
+        with socket.create_connection((hostname, 443), timeout=10) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert = ssock.getpeercert()
-
-                subject = dict(x[0] for x in cert['subject'])
-                issuer = dict(x[0] for x in cert.get('issuer', []))
-
-                print(f"  Sujet du certificat : {subject.get('commonName', 'N/A')}")
-                print(f"  Émetteur : {issuer.get('commonName', 'N/A')}")
-
+                subject = {x[0][0]: x[0][1] for x in cert.get('subject', [])}
+                issuer = {x[0][0]: x[0][1] for x in cert.get('issuer', [])}
                 exp_date_str = cert['notAfter']
                 exp_date = datetime.strptime(exp_date_str, '%b %d %H:%M:%S %Y %Z')
-                print(f"  Date d'expiration : {exp_date.strftime('%Y-%m-%d')}")
+                is_expired = exp_date < datetime.now()
 
-                if exp_date < datetime.now():
-                    print("  ATTENTION : Le certificat a expiré !")
-                else:
-                    print("  Le certificat est valide.")
+                output(f"  Sujet du certificat : {subject.get('commonName', 'N/A')}", json_enabled)
+                output(f"  Émetteur : {issuer.get('commonName', 'N/A')}", json_enabled)
+                output(f"  Date d'expiration : {exp_date.strftime('%Y-%m-%d')}", json_enabled)
+                output(f"  Certificat expiré : {'Oui' if is_expired else 'Non'}", json_enabled)
 
-    except ssl.SSLCertVerificationError as e:
-        print(f"  ERREUR : La vérification du certificat a échoué ({e.reason}).")
-        print("    Cause probable : Le serveur n'envoie pas la chaîne de certificats complète (certificat intermédiaire manquant) ou utilise un certificat auto-signé.")
-        print("    Tentative de récupération des détails du certificat non approuvé...")
-        try:
-            insecure_context = ssl.create_default_context()
-            insecure_context.check_hostname = False
-            insecure_context.verify_mode = ssl.CERT_NONE
-
-            with socket.create_connection((hostname, 443), timeout=5) as sock:
-                with insecure_context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                    cert = ssock.getpeercert()
-                    if not cert:
-                        print("    Le serveur n'a fourni aucun certificat lors de la connexion non sécurisée.")
-                        return
-
-                    subject = dict(x[0] for x in cert.get('subject', []))
-                    issuer = dict(x[0] for x in cert.get('issuer', []))
-                    exp_date_str = cert.get('notAfter')
-
-                    print("    --- DÉTAILS DU CERTIFICAT NON APPROUVÉ ---")
-                    print(f"      Sujet : {subject.get('commonName', 'N/A')}")
-                    print(f"      Émetteur : {issuer.get('commonName', 'N/A')}")
-
-                    if exp_date_str:
-                        exp_date = datetime.strptime(exp_date_str, '%b %d %H:%M:%S %Y %Z')
-                        print(f"      Expire le : {exp_date.strftime('%Y-%m-%d')}")
-                    else:
-                        print("      Date d'expiration : Information non disponible")
-                    print("    -----------------------------------------")
-
-        except Exception as inner_e:
-            print(f"    Impossible de récupérer les détails du certificat non approuvé : {inner_e}")
-    except socket.timeout:
-        print("  ERREUR : La connexion au serveur a échoué (timeout).")
-        print("    Cause probable : Le serveur ne répond pas sur le port 443, ou un pare-feu bloque la connexion.")
+                results = {
+                    "status": "valid" if not is_expired else "expired",
+                    "details": {
+                        "subject": subject.get('commonName', 'N/A'),
+                        "issuer": issuer.get('commonName', 'N/A'),
+                        "expiration_date": exp_date.strftime('%Y-%m-%d'),
+                    }
+                }
     except Exception as e:
-        print(f"  Erreur inattendue lors de la vérification du certificat : {e}")
+        output(f"  Erreur : {e}", json_enabled)
+        results = {"status": "error", "message": str(e)}
 
-    print(f"\n  Pour une analyse SSL/TLS complète, consultez le rapport SSL Labs :")
-    print(f"  https://www.ssllabs.com/ssltest/analyze.html?d={hostname}")
+    output(f"\n  Pour une analyse SSL/TLS complète : https://www.ssllabs.com/ssltest/analyze.html?d={hostname}", json_enabled)
+    if json_enabled:
+        JSON_RESULTS['ssl_certificate'] = results
 
-def scan_tls_protocols(hostname):
-    """Scanne les protocoles SSL/TLS supportés en utilisant sslyze."""
-    print("\n--- Scan des protocoles SSL/TLS supportés ---")
+def scan_tls_protocols(hostname, json_enabled=False):
+    output("\n--- Scan des protocoles SSL/TLS supportés ---", json_enabled)
+    results = {}
     try:
         server_location = ServerNetworkLocation(hostname=hostname, port=443)
-
-        scan_request = ServerScanRequest(
-            server_location=server_location,
-            scan_commands={
-                ScanCommand.SSL_2_0_CIPHER_SUITES, ScanCommand.SSL_3_0_CIPHER_SUITES,
-                ScanCommand.TLS_1_0_CIPHER_SUITES, ScanCommand.TLS_1_1_CIPHER_SUITES,
-                ScanCommand.TLS_1_2_CIPHER_SUITES, ScanCommand.TLS_1_3_CIPHER_SUITES,
-            },
-        )
-
+        scan_request = ServerScanRequest(server_location=server_location)
         scanner = Scanner()
         scanner.queue_scans([scan_request])
-
-        print(f"  Scan en cours sur {hostname}, cela peut prendre un moment...")
+        output(f"  Scan en cours sur {hostname}...", json_enabled)
 
         for server_scan_result in scanner.get_results():
-            if server_scan_result.scan_status == ServerScanStatusEnum.ERROR_NO_CONNECTIVITY:
-                print(f"  ERREUR : Impossible de se connecter à {hostname}: {server_scan_result.connectivity_error_trace}")
-                return
+            if server_scan_result.scan_status != ServerScanStatusEnum.COMPLETED:
+                error_msg = f"ERREUR: {server_scan_result.connectivity_error_trace}"
+                output(f"  {error_msg}", json_enabled)
+                results = {"status": "error", "message": error_msg}
+                break
 
-            # Associer les résultats aux noms de protocoles
-            scan_result = server_scan_result.scan_result
-            protocol_results = {
-                "SSL 2.0": scan_result.ssl_2_0_cipher_suites,
-                "SSL 3.0": scan_result.ssl_3_0_cipher_suites,
-                "TLS 1.0": scan_result.tls_1_0_cipher_suites,
-                "TLS 1.1": scan_result.tls_1_1_cipher_suites,
-                "TLS 1.2": scan_result.tls_1_2_cipher_suites,
-                "TLS 1.3": scan_result.tls_1_3_cipher_suites,
+            res = server_scan_result.scan_result
+            protos = {
+                "SSLv2": res.ssl_2_0_cipher_suites, "SSLv3": res.ssl_3_0_cipher_suites,
+                "TLSv1.0": res.tls_1_0_cipher_suites, "TLSv1.1": res.tls_1_1_cipher_suites,
+                "TLSv1.2": res.tls_1_2_cipher_suites, "TLSv1.3": res.tls_1_3_cipher_suites
             }
+            for name, result_attempt in protos.items():
+                accepted_ciphers = []
+                is_supported = False
+                if result_attempt.status == ScanCommandAttemptStatusEnum.COMPLETED and result_attempt.result.accepted_cipher_suites:
+                    is_supported = True
+                    accepted_ciphers = [cipher.cipher_suite.name for cipher in result_attempt.result.accepted_cipher_suites]
 
-            for name, result_attempt in protocol_results.items():
-                if result_attempt.status == ScanCommandAttemptStatusEnum.ERROR:
-                    print(f"    ⚠️  Le scan pour {name} a échoué : {result_attempt.error_reason}")
-                    continue
+                is_compliant = ("TLSv1.2" in name or "TLSv1.3" in name) or not is_supported
+                status_str = "CONFORME" if is_compliant else "NON CONFORME"
+                output(f"    {'✅' if is_compliant else '❌'} {name}: {'Supporté' if is_supported else 'Non supporté'} ({status_str})", json_enabled)
 
-                result = result_attempt.result
-                if result.accepted_cipher_suites:
-                    if name in ["TLS 1.2", "TLS 1.3"]:
-                        print(f"    ✅ {name} : Supporté (CONFORME)")
-                    else:
-                        print(f"    ❌ {name} : Supporté (NON CONFORME - Vulnérable)")
-                else:
-                    print(f"    ✅ {name} : Non supporté (CONFORME)")
+                results[name] = {
+                    "supported": is_supported,
+                    "compliant": is_compliant,
+                    "accepted_cipher_suites": accepted_ciphers
+                }
             break
-    except ServerHostnameCouldNotBeResolved:
-        print(f"  ERREUR : Le nom d'hôte '{hostname}' n'a pas pu être résolu.")
     except Exception as e:
-        print(f"  Une erreur inattendue est survenue lors du scan sslyze : {e}")
+        output(f"  Erreur : {e}", json_enabled)
+        results = {"status": "error", "message": str(e)}
 
-def check_http_to_https_redirect(hostname):
-    """Vérifie si le site redirige automatiquement de HTTP vers HTTPS."""
-    print("\n--- Analyse de la redirection HTTP vers HTTPS ---")
+    if json_enabled:
+        JSON_RESULTS['tls_protocols'] = results
+
+def check_http_to_https_redirect(hostname, json_enabled=False):
+    output("\n--- Analyse de la redirection HTTP vers HTTPS ---", json_enabled)
+    results = {}
     try:
         url = f"http://{hostname}"
         response = requests.get(url, allow_redirects=False, timeout=10)
+        is_redirect = 300 <= response.status_code < 400
+        location = response.headers.get('Location', '')
+        redirects_to_https = location.startswith('https://')
 
-        if 300 <= response.status_code < 400:
-            location = response.headers.get('Location', '')
-            if location.startswith('https://'):
-                print(f"  SUCCÈS : Le site redirige de HTTP vers HTTPS (Code: {response.status_code}).")
-            else:
-                print(f"  ERREUR : Le site redirige, mais pas directement vers HTTPS (vers: {location}).")
+        if is_redirect and redirects_to_https:
+            output(f"  SUCCÈS : Redirection vers HTTPS (Code: {response.status_code}).", json_enabled)
         else:
-            print(f"  ERREUR : Le site ne redirige pas de HTTP vers HTTPS (Code: {response.status_code}).")
+            output(f"  ERREUR : Pas de redirection directe vers HTTPS (Code: {response.status_code}, Location: {location}).", json_enabled)
 
-    except requests.exceptions.Timeout:
-        print("  ERREUR : La connexion au serveur a échoué (timeout) lors du test de redirection.")
-    except requests.exceptions.RequestException as e:
-        print(f"  Erreur inattendue lors du test de redirection : {e}")
-
-def check_email_security_dns(hostname):
-    """Vérifie la présence des enregistrements DNS de sécurité e-mail (DMARC, SPF)."""
-    print("\n--- Analyse des enregistrements de sécurité e-mail (DNS) ---")
-
-    # 1. Vérification DMARC
-    print("\n  1. Enregistrement DMARC :")
-    try:
-        dmarc_query = f"_dmarc.{hostname}"
-        answers = dns.resolver.resolve(dmarc_query, 'TXT')
-        dmarc_record = ' '.join([b.decode('utf-8') for b in answers[0].strings])
-        print(f"    ✅ SUCCÈS : Enregistrement DMARC trouvé.")
-        print(f"      Valeur : {dmarc_record}")
-    except dns.resolver.NXDOMAIN:
-        print("    ❌ ERREUR : Aucun enregistrement DMARC trouvé. Très recommandé.")
-    except dns.resolver.NoAnswer:
-        print("    ❌ ERREUR : La requête DMARC n'a retourné aucune réponse.")
+        results = {"redirects": is_redirect, "to_https": redirects_to_https, "status_code": response.status_code, "location": location}
     except Exception as e:
-        print(f"    ⚠️ AVERTISSEMENT : Une erreur est survenue lors de la recherche DMARC : {e}")
+        output(f"  Erreur : {e}", json_enabled)
+        results = {"status": "error", "message": str(e)}
 
-    # 2. Vérification SPF
-    print("\n  2. Enregistrement SPF :")
-    try:
-        answers = dns.resolver.resolve(hostname, 'TXT')
-        spf_record = None
-        for record in answers:
-            txt_record = ' '.join([b.decode('utf-8') for b in record.strings])
-            if txt_record.startswith('v=spf1'):
-                spf_record = txt_record
-                break
+    if json_enabled:
+        JSON_RESULTS['http_to_https_redirect'] = results
 
-        if spf_record:
-            print(f"    ✅ SUCCÈS : Enregistrement SPF trouvé.")
-            print(f"      Valeur : {spf_record}")
-        else:
-            print("    ❌ ERREUR : Aucun enregistrement SPF (v=spf1) trouvé dans les enregistrements TXT.")
-    except dns.resolver.NXDOMAIN:
-        print(f"    ❌ ERREUR : Le domaine '{hostname}' n'existe pas.")
-    except dns.resolver.NoAnswer:
-        print("    ❌ ERREUR : Aucune réponse pour les enregistrements TXT du domaine (nécessaire pour SPF).")
-    except Exception as e:
-        print(f"    ⚠️ AVERTISSEMENT : Une erreur est survenue lors de la recherche SPF : {e}")
-
-def check_security_headers(hostname):
-    """Analyse les en-têtes de sécurité HTTP, y compris leurs valeurs."""
-    print("\n--- Analyse des en-têtes de sécurité HTTP ---")
+def check_security_headers(hostname, json_enabled=False):
+    output("\n--- Analyse des en-têtes de sécurité HTTP ---", json_enabled)
+    results = {}
     try:
         url = f"https://{hostname}"
         response = requests.get(url, timeout=10)
         headers = {k.lower(): v for k, v in response.headers.items()}
+        output(f"  Analyse pour : {response.url}", json_enabled)
 
-        print(f"  Analyse des en-têtes pour l'URL finale : {response.url}")
+        headers_to_check = ['Strict-Transport-Security', 'X-Frame-Options', 'X-Content-Type-Options', 'Content-Security-Policy']
+        for header in headers_to_check:
+            key = header.lower()
+            value = headers.get(key)
+            output(f"  - {header}: {'Trouvé' if value else 'Manquant'}", json_enabled)
+            results[key] = {"present": bool(value), "value": value}
+    except Exception as e:
+        output(f"  Erreur : {e}", json_enabled)
+        results = {"status": "error", "message": str(e)}
 
-        # 1. Strict-Transport-Security (HSTS)
-        print("\n  1. Strict-Transport-Security (HSTS) :")
-        if 'strict-transport-security' in headers:
-            value = headers['strict-transport-security']
-            max_age_found = False
-            if 'max-age' in value:
-                max_age_val = int(value.split('max-age=')[1].split(';')[0])
-                if max_age_val >= 15552000: # ~6 mois
-                    print(f"    ✅ SUCCÈS : HSTS est activé avec un max-age long ({max_age_val}s).")
-                    max_age_found = True
-                else:
-                    print(f"    ⚠️ AVERTISSEMENT : HSTS est activé, mais le max-age est court ({max_age_val}s). Recommandé : >= 15552000.")
-            if not max_age_found:
-                 print(f"    ⚠️ AVERTISSEMENT : L'en-tête HSTS est présent mais n'a pas de directive 'max-age'.")
+    if json_enabled:
+        JSON_RESULTS['security_headers'] = results
 
-            if 'includesubdomains' in value.lower():
-                print("    ✅ SUCCÈS : La directive 'includeSubDomains' est présente.")
-            else:
-                print("    ⚠️ AVERTISSEMENT : La directive 'includeSubDomains' est recommandée mais absente.")
-        else:
-            print("    ❌ ERREUR : L'en-tête HSTS est manquant. Très recommandé.")
+def check_email_security_dns(hostname, json_enabled=False):
+    output("\n--- Analyse des enregistrements DNS de sécurité e-mail ---", json_enabled)
+    records = {"dmarc": {}, "spf": {}}
+    try:
+        dmarc_answers = dns.resolver.resolve(f"_dmarc.{hostname}", 'TXT')
+        dmarc_record = ' '.join([b.decode('utf-8') for b in dmarc_answers[0].strings])
+        output("  - DMARC: Trouvé", json_enabled)
+        records["dmarc"] = {"present": True, "record": dmarc_record}
+    except Exception:
+        output("  - DMARC: Manquant", json_enabled)
+        records["dmarc"] = {"present": False}
 
-        # 2. X-Frame-Options
-        print("\n  2. X-Frame-Options :")
-        if 'x-frame-options' in headers:
-            value = headers['x-frame-options'].upper()
-            if value in ['DENY', 'SAMEORIGIN']:
-                print(f"    ✅ SUCCÈS : X-Frame-Options est correctement configuré à '{value}'.")
-            else:
-                print(f"    ⚠️ AVERTISSEMENT : X-Frame-Options a une valeur non standard : '{value}'.")
-        else:
-            print("    ❌ ERREUR : L'en-tête X-Frame-Options est manquant. Recommandé pour prévenir le clickjacking.")
+    try:
+        txt_answers = dns.resolver.resolve(hostname, 'TXT')
+        spf_record = next((s for s in (''.join(r.strings) for r in txt_answers) if s.startswith('v=spf1')), None)
+        output(f"  - SPF: {'Trouvé' if spf_record else 'Manquant'}", json_enabled)
+        records["spf"] = {"present": bool(spf_record), "record": spf_record}
+    except Exception:
+        output("  - SPF: Manquant", json_enabled)
+        records["spf"] = {"present": False}
 
-        # 3. X-Content-Type-Options
-        print("\n  3. X-Content-Type-Options :")
-        if 'x-content-type-options' in headers:
-            value = headers['x-content-type-options'].lower()
-            if value == 'nosniff':
-                print(f"    ✅ SUCCÈS : X-Content-Type-Options est correctement configuré à 'nosniff'.")
-            else:
-                print(f"    ⚠️ AVERTISSEMENT : X-Content-Type-Options a une valeur inattendue : '{value}'.")
-        else:
-            print("    ❌ ERREUR : L'en-tête X-Content-Type-Options est manquant.")
+    if json_enabled:
+        JSON_RESULTS['email_security_dns'] = records
 
-        # 4. Content-Security-Policy (CSP)
-        print("\n  4. Content-Security-Policy (CSP) :")
-        if 'content-security-policy' in headers:
-            print("    ✅ SUCCÈS : L'en-tête Content-Security-Policy est présent.")
-            print(f"      Valeur : {headers['content-security-policy'][:100]}...") # Affiche les 100 premiers caractères
-        else:
-            print("    ⚠️ AVERTISSEMENT : L'en-tête Content-Security-Policy est manquant. Recommandé pour une défense en profondeur.")
+def check_registrar(hostname, json_enabled=False):
+    output("\n--- Analyse WHOIS du bureau d'enregistrement ---", json_enabled)
+    results = {}
+    try:
+        w = whois.whois(hostname)
+        registrar = w.registrar
+        if isinstance(registrar, list): registrar = registrar[0]
+        output(f"  Bureau d'enregistrement : {registrar if registrar else 'Non trouvé'}", json_enabled)
+        results = {"registrar": registrar}
+    except Exception as e:
+        output(f"  Erreur WHOIS : {e}", json_enabled)
+        results = {"status": "error", "message": str(e)}
 
-    except requests.exceptions.Timeout:
-        print("  ERREUR : La connexion au serveur a échoué (timeout) lors de la récupération des en-têtes.")
-        print("    Cause probable : Le serveur est trop lent à répondre ou un pare-feu bloque la connexion.")
-    except requests.exceptions.SSLError as e:
-        print("  ERREUR : Une erreur SSL est survenue lors de la récupération des en-têtes.")
-        print(f"    Cause probable : Le certificat du site n'est pas approuvé (auto-signé, chaîne incomplète, etc.). Détail : {e}")
-    except requests.exceptions.RequestException as e:
-        print(f"  Erreur inattendue lors de la récupération des en-têtes : {e}")
+    if json_enabled:
+        JSON_RESULTS['registrar'] = results
+
+def check_cookie_security(hostname, json_enabled=False):
+    output("\n--- Analyse de la sécurité des cookies ---", json_enabled)
+    results = []
+    try:
+        url = f"https://{hostname}"
+        response = requests.get(url, timeout=10)
+        if not response.cookies:
+            output("  Aucun cookie trouvé.", json_enabled)
+            return
+
+        raw_cookies = response.raw.headers.get_all('Set-Cookie', [])
+        for cookie_header in raw_cookies:
+            parts = [p.strip().lower() for p in cookie_header.split(';')]
+            name = parts[0].split('=')[0]
+
+            is_secure = 'secure' in parts
+            is_httponly = 'httponly' in parts
+            samesite_attr = next((p for p in parts if p.startswith('samesite=')), None)
+
+            output(f"  - Cookie '{name}': Secure={is_secure}, HttpOnly={is_httponly}, SameSite={samesite_attr}", json_enabled)
+            if json_enabled:
+                results.append({
+                    "name": name,
+                    "attributes": { "secure": is_secure, "httponly": is_httponly, "samesite": samesite_attr }
+                })
+    except Exception as e:
+        output(f"  Erreur : {e}", json_enabled)
+        if json_enabled: results.append({"status": "error", "message": str(e)})
+
+    if json_enabled:
+        JSON_RESULTS['cookies'] = results
 
 def main():
-    """Fonction principale du script."""
+    global report_file, JSON_RESULTS
+
     parser = argparse.ArgumentParser(description="Analyseur de sécurité de site web.")
-    parser.add_argument("url", help="L'URL du site web à analyser (ex: google.com).")
+    parser.add_argument("url", help="URL du site (ex: google.com).")
+    parser.add_argument("--rapport", nargs='?', const='autoname', default=None, help="Génère un rapport.")
+    parser.add_argument("--format", choices=['text', 'json'], default='text', help="Format du rapport.")
     args = parser.parse_args()
 
     hostname = get_hostname(args.url)
+    json_enabled = (args.format == 'json')
+    report_filename = None
 
-    print(f"Vérification de l'existence de l'hôte : {hostname}")
-    if not check_host_exists(hostname):
-        print(f"Erreur : L'hôte '{hostname}' est introuvable. Veuillez vérifier le nom de domaine.")
-        sys.exit(1)
+    if args.rapport:
+        if args.rapport == 'autoname':
+            date_str = datetime.now().strftime('%d%m%y')
+            suffix = "json" if json_enabled else "txt"
+            report_filename = f"{hostname}_{date_str}.{suffix}"
+        else:
+            report_filename = args.rapport
 
-    print(f"Hôte trouvé. Début de l'analyse de : {hostname}")
-    check_ssl_certificate(hostname)
-    scan_tls_protocols(hostname)
-    check_http_to_https_redirect(hostname)
-    check_security_headers(hostname)
-    check_email_security_dns(hostname)
+        try:
+            report_file = open(report_filename, 'w', encoding='utf-8')
+        except IOError as e:
+            print(f"Erreur: Impossible d'ouvrir '{report_filename}': {e}")
+            sys.exit(1)
+
+    try:
+        output(f"Analyse de : {hostname}", json_enabled)
+        if not check_host_exists(hostname):
+            output(f"Erreur : Hôte '{hostname}' introuvable.", json_enabled)
+            sys.exit(1)
+
+        if json_enabled:
+            JSON_RESULTS['domain'] = hostname
+            JSON_RESULTS['scan_date'] = datetime.now().isoformat()
+
+        check_ssl_certificate(hostname, json_enabled)
+        scan_tls_protocols(hostname, json_enabled)
+        check_http_to_https_redirect(hostname, json_enabled)
+        check_security_headers(hostname, json_enabled)
+        check_email_security_dns(hostname, json_enabled)
+        check_registrar(hostname, json_enabled)
+        check_cookie_security(hostname, json_enabled)
+
+    finally:
+        if report_file:
+            if json_enabled:
+                json.dump(JSON_RESULTS, report_file, indent=4)
+            report_file.close()
+            print(f"\nRapport sauvegardé dans : {report_filename}")
 
 if __name__ == "__main__":
     main()

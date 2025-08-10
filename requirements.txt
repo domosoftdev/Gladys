@@ -1,3 +1,4 @@
 requests
 sslyze
 dnspython
+python-whois
